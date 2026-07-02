@@ -902,21 +902,10 @@ class MessageLoaderTest: XCTestCase {
                 interactionFetchers: [interactionFetcher],
             )
 
-            XCTAssertNoThrow(try mockDB.read { tx in
-                try loader.loadInitialMessagePage(
-                    focusMessageId: oldestUnreadInteraction.uniqueId,
-                    reusableInteractions: [:],
-                    deletedInteractionIds: [],
-                    preprocessingContext: preprocessingContext(
-                        threadUniqueId: threadUniqueId,
-                        oldestUnreadSortId: oldestUnreadSortId,
-                    ),
-                    tx: tx,
-                )
-
-                var loadedPageCount = 0
-                while loader.canLoadNewer, loadedPageCount < pageLimit {
-                    try loader.loadNewerMessagePage(
+            let loadSucceeded = mockDB.read { tx in
+                do {
+                    try loader.loadInitialMessagePage(
+                        focusMessageId: oldestUnreadInteraction.uniqueId,
                         reusableInteractions: [:],
                         deletedInteractionIds: [],
                         preprocessingContext: preprocessingContext(
@@ -925,9 +914,27 @@ class MessageLoaderTest: XCTestCase {
                         ),
                         tx: tx,
                     )
-                    loadedPageCount += 1
+
+                    var loadedPageCount = 0
+                    while loader.canLoadNewer, loadedPageCount < pageLimit {
+                        try loader.loadNewerMessagePage(
+                            reusableInteractions: [:],
+                            deletedInteractionIds: [],
+                            preprocessingContext: preprocessingContext(
+                                threadUniqueId: threadUniqueId,
+                                oldestUnreadSortId: oldestUnreadSortId,
+                            ),
+                            tx: tx,
+                        )
+                        loadedPageCount += 1
+                    }
+                    return true
+                } catch {
+                    XCTFail("Failed to load unread performance window: \(error)")
+                    return false
                 }
-            })
+            }
+            XCTAssertTrue(loadSucceeded)
             XCTAssertLessThanOrEqual(loader.loadedDisplayableInteractions.count, 500)
         }
     }
@@ -1042,7 +1049,7 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
                     continue
                 }
                 incomingMessage.anyUpdateIncomingMessage(transaction: tx) { message in
-                    message.read = false
+                    message.wasRead = false
                 }
             }
         }
