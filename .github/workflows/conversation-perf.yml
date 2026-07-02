@@ -1,0 +1,125 @@
+name: Conversation Performance
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_label:
+        description: "Runner label. Use macos-26 for cheapest public-fork runs; try macos-26-xlarge if the build does not fit."
+        required: true
+        default: macos-26
+        type: choice
+        options:
+          - macos-26
+          - macos-26-intel
+          - macos-26-xlarge
+      long_thread_messages:
+        description: "Messages to seed for the long-conversation send persistence test."
+        required: true
+        default: "100000"
+      unread_thread_messages:
+        description: "Messages to seed for unread-window tests."
+        required: true
+        default: "10000"
+      unread_messages:
+        description: "Unread tail size for unread-window and mark-read tests."
+        required: true
+        default: "250"
+      unread_scroll_pages:
+        description: "MessageLoader pages to traverse after opening at the unread boundary."
+        required: true
+        default: "8"
+      measure_iterations:
+        description: "XCTest performance iterations."
+        required: true
+        default: "3"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_26.5.app
+  FASTLANE_XCODEBUILD_SETTINGS_RETRIES: 7
+  SIGNAL_ENABLE_CONVERSATION_PERF_TESTS: "1"
+  SIGNAL_PERF_LONG_THREAD_MESSAGES: ${{ inputs.long_thread_messages }}
+  SIGNAL_PERF_UNREAD_THREAD_MESSAGES: ${{ inputs.unread_thread_messages }}
+  SIGNAL_PERF_UNREAD_MESSAGES: ${{ inputs.unread_messages }}
+  SIGNAL_PERF_UNREAD_SCROLL_PAGES: ${{ inputs.unread_scroll_pages }}
+  SIGNAL_PERF_MEASURE_ITERATIONS: ${{ inputs.measure_iterations }}
+
+jobs:
+  conversation_performance:
+    name: Conversation Performance
+    timeout-minutes: 120
+    runs-on: ${{ inputs.runner_label }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Check Xcode version
+        run: Scripts/check_xcode_version.py --relaxed
+
+      - name: Download Metal toolchain
+        run: xcodebuild -downloadComponent MetalToolchain
+
+      - name: Download iOS runtime
+        run: xcodebuild -downloadPlatform iOS
+
+      - name: Setup Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          bundler-cache: true
+
+      - name: Fetch RingRTC
+        run: make fetch-ringrtc
+
+      - name: Select simulator
+        shell: bash
+        run: |
+          LATEST_IOS_RUNTIME=$(
+            xcrun simctl list runtimes -j \
+              | jq -r '.runtimes | map(select(.name | startswith("iOS"))) | sort_by(.version) | last | .identifier'
+          )
+          LATEST_IOS_SIM_ID=$(
+            xcrun simctl list devices -j \
+              | jq -r --arg runtime "$LATEST_IOS_RUNTIME" '.devices[$runtime] | first | .udid'
+          )
+          echo "IOS_SIM_ID=$LATEST_IOS_SIM_ID" >> "$GITHUB_ENV"
+          echo "Using iOS runtime: $LATEST_IOS_RUNTIME"
+          echo "Using simulator: $LATEST_IOS_SIM_ID"
+
+      - name: Run conversation performance tests
+        shell: bash
+        run: |
+          set -o pipefail
+          LOG_DIR="$HOME/Library/Logs/Signal-Conversation-Perf"
+          RESULT_BUNDLE="$LOG_DIR/ConversationPerf.xcresult"
+          SCHEMA_DIR="$HOME/Library/Signal-iOS-Schema"
+          rm -rf "$LOG_DIR" "$SCHEMA_DIR"
+          mkdir -p "$LOG_DIR" "$SCHEMA_DIR"
+
+          NSUnbufferedIO=YES TEST_RUNNER_SCHEMA_DUMP_PATH="$SCHEMA_DIR/schema.json" xcodebuild \
+            -workspace Signal.xcworkspace \
+            -scheme Signal \
+            -destination "platform=iOS Simulator,id=$IOS_SIM_ID" \
+            -disableAutomaticPackageResolution \
+            -test-timeouts-enabled YES \
+            -maximum-test-execution-time-allowance 7200 \
+            -default-test-execution-time-allowance 7200 \
+            -resultBundlePath "$RESULT_BUNDLE" \
+            -only-testing:SignalTests/MessageLoaderTest/test_performance_scrollThroughUnreadWindow_withUnreadMarker \
+            -only-testing:SignalTests/MessageLoaderTest/test_performance_scrollThroughUnreadWindow_withoutUnreadMarker \
+            -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_sendPersistence_inLongConversation \
+            -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markManyUnreadsRead_inLargeConversation \
+            build test \
+            2>&1 | tee "$LOG_DIR/ConversationPerf.log"
+
+      - name: Upload performance logs
+        uses: actions/upload-artifact@v6
+        if: always()
+        with:
+          name: Conversation Performance Logs
+          path: ~/Library/Logs/Signal-Conversation-Perf

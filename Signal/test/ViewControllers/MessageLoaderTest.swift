@@ -7,6 +7,48 @@ import XCTest
 
 @testable import Signal
 @testable import SignalServiceKit
+@testable import SignalUI
+
+private enum ConversationPerformanceTestConfig {
+    static let enableEnvironmentKey = "SIGNAL_ENABLE_CONVERSATION_PERF_TESTS"
+
+    static var isEnabled: Bool {
+        ProcessInfo.processInfo.environment[enableEnvironmentKey] == "1"
+    }
+
+    static func intValue(_ key: String, default defaultValue: Int) -> Int {
+        guard
+            let rawValue = ProcessInfo.processInfo.environment[key],
+            let value = Int(rawValue),
+            value > 0
+        else {
+            return defaultValue
+        }
+        return value
+    }
+
+    static func skipUnlessEnabled() throws {
+        try XCTSkipUnless(
+            isEnabled,
+            "Set \(enableEnvironmentKey)=1 to run long-conversation performance tests.",
+        )
+    }
+
+    static func measureOptions(
+        defaultIterationCount: Int = 5,
+        manuallyStart: Bool = false,
+    ) -> XCTMeasureOptions {
+        let options = XCTMeasureOptions()
+        options.iterationCount = intValue(
+            "SIGNAL_PERF_MEASURE_ITERATIONS",
+            default: defaultIterationCount,
+        )
+        if manuallyStart {
+            options.invocationOptions = [.manuallyStart]
+        }
+        return options
+    }
+}
 
 class MessageLoaderTest: XCTestCase {
     private var cursorFactory: MockCursorFactory!
@@ -79,7 +121,14 @@ class MessageLoaderTest: XCTestCase {
 
     private func createInteractions(_ count: Int64, threadUniqueId: String) -> [TSInteraction] {
         return ((1 as Int64)...count).map { rowId in
-            TSInteraction(grdbId: rowId, uniqueId: UUID().uuidString, receivedAtTimestamp: 0, sortId: 0, timestamp: 0, uniqueThreadId: threadUniqueId)
+            TSInteraction(
+                grdbId: rowId,
+                uniqueId: UUID().uuidString,
+                receivedAtTimestamp: UInt64(rowId),
+                sortId: UInt64(rowId),
+                timestamp: UInt64(rowId),
+                uniqueThreadId: threadUniqueId,
+            )
         }
     }
 
@@ -161,6 +210,16 @@ class MessageLoaderTest: XCTestCase {
         return MessageLoaderPreprocessingContext(
             threadUniqueId: threadUniqueId,
             oldestUnreadSortId: nil,
+        )
+    }
+
+    private func preprocessingContext(
+        threadUniqueId: String,
+        oldestUnreadSortId: UInt64?,
+    ) -> MessageLoaderPreprocessingContext {
+        return MessageLoaderPreprocessingContext(
+            threadUniqueId: threadUniqueId,
+            oldestUnreadSortId: oldestUnreadSortId,
         )
     }
 
@@ -806,5 +865,186 @@ class MessageLoaderTest: XCTestCase {
         let loadCount3 = messageLoader.loadedInteractions.count
         XCTAssertLessThan(loadCount2, loadCount3)
         XCTAssertLessThan(loadCount3, 150)
+    }
+
+    func test_performance_scrollThroughUnreadWindow_withUnreadMarker() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        runUnreadWindowPerformance(includeUnreadMarker: true)
+    }
+
+    func test_performance_scrollThroughUnreadWindow_withoutUnreadMarker() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        runUnreadWindowPerformance(includeUnreadMarker: false)
+    }
+
+    private func runUnreadWindowPerformance(includeUnreadMarker: Bool) {
+        let threadUniqueId = UUID().uuidString
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let pageLimit = ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_SCROLL_PAGES", default: 8)
+        let interactions = createInteractions(Int64(messageCount), threadUniqueId: threadUniqueId)
+        setInteractions(interactions)
+
+        let oldestUnreadInteraction = interactions[messageCount - unreadCount]
+        let oldestUnreadSortId = includeUnreadMarker ? oldestUnreadInteraction.sortId : nil
+
+        measure(metrics: [XCTClockMetric()]) {
+            let loader = MessageLoader(
+                cursorFactory: cursorFactory,
+                interactionFetchers: [interactionFetcher],
+            )
+
+            XCTAssertNoThrow(try mockDB.read { tx in
+                try loader.loadInitialMessagePage(
+                    focusMessageId: oldestUnreadInteraction.uniqueId,
+                    reusableInteractions: [:],
+                    deletedInteractionIds: [],
+                    preprocessingContext: preprocessingContext(
+                        threadUniqueId: threadUniqueId,
+                        oldestUnreadSortId: oldestUnreadSortId,
+                    ),
+                    tx: tx,
+                )
+
+                var loadedPageCount = 0
+                while loader.canLoadNewer, loadedPageCount < pageLimit {
+                    try loader.loadNewerMessagePage(
+                        reusableInteractions: [:],
+                        deletedInteractionIds: [],
+                        preprocessingContext: preprocessingContext(
+                            threadUniqueId: threadUniqueId,
+                            oldestUnreadSortId: oldestUnreadSortId,
+                        ),
+                        tx: tx,
+                    )
+                    loadedPageCount += 1
+                }
+            })
+            XCTAssertLessThanOrEqual(loader.loadedDisplayableInteractions.count, 500)
+        }
+    }
+}
+
+final class ConversationDatabasePerformanceTest: SignalBaseTest {
+    private struct SeededThread {
+        let thread: TSContactThread
+        let unreadInteractionIds: [String]
+    }
+
+    private lazy var incomingMessageBody = String(repeating: "incoming perf message ", count: 3)
+    private lazy var outgoingMessageBody = String(repeating: "outgoing perf message ", count: 3)
+
+    func test_performance_sendPersistence_inLongConversation() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_LONG_THREAD_MESSAGES",
+            default: 100_000,
+        )
+        let fixture = seedThread(messageCount: messageCount, unreadTailCount: 0)
+
+        measure(
+            metrics: [XCTClockMetric()],
+            options: ConversationPerformanceTestConfig.measureOptions(defaultIterationCount: 3),
+        ) {
+            let persistenceExpectation = expectation(description: "message persisted")
+            ThreadUtil.enqueueMessage(
+                body: MessageBody(text: "perf send \(UUID().uuidString)", ranges: .empty),
+                thread: fixture.thread,
+                persistenceCompletionHandler: {
+                    persistenceExpectation.fulfill()
+                },
+            )
+            wait(for: [persistenceExpectation], timeout: 120)
+        }
+    }
+
+    func test_performance_markManyUnreadsRead_inLargeConversation() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let fixture = seedThread(messageCount: messageCount, unreadTailCount: unreadCount)
+
+        measure(
+            metrics: [XCTClockMetric()],
+            options: ConversationPerformanceTestConfig.measureOptions(manuallyStart: true),
+        ) {
+            resetUnreadMessages(fixture.unreadInteractionIds)
+            startMeasuring()
+            write { tx in
+                fixture.thread.markAllAsRead(updateStorageService: false, transaction: tx)
+            }
+            stopMeasuring()
+        }
+    }
+
+    private func seedThread(messageCount: Int, unreadTailCount: Int) -> SeededThread {
+        let unreadStartIndex = max(0, messageCount - unreadTailCount)
+        return write { tx in
+            let thread = ContactThreadFactory().create(transaction: tx)
+            let incomingFactory = IncomingMessageFactory()
+            incomingFactory.threadCreator = { _ in thread }
+            incomingFactory.messageBodyBuilder = { self.incomingMessageBody }
+
+            let outgoingFactory = OutgoingMessageFactory()
+            outgoingFactory.threadCreator = { _ in thread }
+            outgoingFactory.messageBodyBuilder = { self.outgoingMessageBody }
+
+            var unreadInteractionIds = [String]()
+            for messageIndex in 0..<messageCount {
+                autoreleasepool {
+                    if messageIndex >= unreadStartIndex {
+                        let message = incomingFactory.create(transaction: tx)
+                        unreadInteractionIds.append(message.uniqueId)
+                    } else if messageIndex.isMultiple(of: 2) {
+                        let message = incomingFactory.create(transaction: tx)
+                        message.markAsRead(
+                            atTimestamp: Date.ows_millisecondTimestamp(),
+                            thread: thread,
+                            circumstance: .onThisDevice,
+                            shouldClearNotifications: false,
+                            transaction: tx,
+                        )
+                    } else {
+                        _ = outgoingFactory.create(transaction: tx)
+                    }
+                }
+            }
+
+            return SeededThread(thread: thread, unreadInteractionIds: unreadInteractionIds)
+        }
+    }
+
+    private func resetUnreadMessages(_ interactionIds: [String]) {
+        write { tx in
+            let interactions = InteractionFinder.interactions(
+                withInteractionIds: Set(interactionIds),
+                transaction: tx,
+            )
+            for interaction in interactions {
+                guard let incomingMessage = interaction as? TSIncomingMessage else {
+                    XCTFail("Expected unread fixture to contain only incoming messages.")
+                    continue
+                }
+                incomingMessage.anyUpdateIncomingMessage(transaction: tx) { message in
+                    message.read = false
+                }
+            }
+        }
     }
 }
