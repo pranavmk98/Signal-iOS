@@ -101,6 +101,19 @@ jobs:
           rm -rf "$LOG_DIR" "$SCHEMA_DIR"
           mkdir -p "$LOG_DIR" "$SCHEMA_DIR"
 
+          xcrun simctl boot "$IOS_SIM_ID" || true
+          xcrun simctl bootstatus "$IOS_SIM_ID" -b
+          for key in \
+            SIGNAL_ENABLE_CONVERSATION_PERF_TESTS \
+            SIGNAL_PERF_LONG_THREAD_MESSAGES \
+            SIGNAL_PERF_UNREAD_THREAD_MESSAGES \
+            SIGNAL_PERF_UNREAD_MESSAGES \
+            SIGNAL_PERF_UNREAD_SCROLL_PAGES \
+            SIGNAL_PERF_MEASURE_ITERATIONS
+          do
+            xcrun simctl spawn "$IOS_SIM_ID" launchctl setenv "$key" "${!key}"
+          done
+
           NSUnbufferedIO=YES TEST_RUNNER_SCHEMA_DUMP_PATH="$SCHEMA_DIR/schema.json" xcodebuild \
             -workspace Signal.xcworkspace \
             -scheme Signal \
