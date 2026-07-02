@@ -994,7 +994,21 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
             resetUnreadMessages(fixture.unreadInteractionIds)
             startMeasuring()
             write { tx in
-                fixture.thread.markAllAsRead(updateStorageService: false, transaction: tx)
+                let finder = InteractionFinder(threadUniqueId: fixture.thread.uniqueId)
+                var cursor = finder.fetchAllUnreadMessages(transaction: tx)
+                do {
+                    while let message = try cursor.next() {
+                        message.markAsRead(
+                            atTimestamp: Date.ows_millisecondTimestamp(),
+                            thread: fixture.thread,
+                            circumstance: .onThisDeviceWhilePendingMessageRequest,
+                            shouldClearNotifications: false,
+                            transaction: tx,
+                        )
+                    }
+                } catch {
+                    XCTFail("Failed to fetch unread messages: \(error)")
+                }
             }
             stopMeasuring()
         }
@@ -1020,13 +1034,9 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
                         unreadInteractionIds.append(message.uniqueId)
                     } else if messageIndex.isMultiple(of: 2) {
                         let message = incomingFactory.create(transaction: tx)
-                        message.markAsRead(
-                            atTimestamp: Date.ows_millisecondTimestamp(),
-                            thread: thread,
-                            circumstance: .onThisDevice,
-                            shouldClearNotifications: false,
-                            transaction: tx,
-                        )
+                        message.anyUpdateIncomingMessage(transaction: tx) { message in
+                            message.wasRead = true
+                        }
                     } else {
                         _ = outgoingFactory.create(transaction: tx)
                     }
