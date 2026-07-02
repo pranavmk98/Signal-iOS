@@ -44,7 +44,7 @@ private enum ConversationPerformanceTestConfig {
             default: defaultIterationCount,
         )
         if manuallyStart {
-            options.invocationOptions = [.manuallyStart]
+            options.invocationOptions = [.manuallyStart, .manuallyStop]
         }
         return options
     }
@@ -948,6 +948,15 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
 
     private lazy var incomingMessageBody = String(repeating: "incoming perf message ", count: 3)
     private lazy var outgoingMessageBody = String(repeating: "outgoing perf message ", count: 3)
+
+    @MainActor
+    override func setUp() {
+        super.setUp()
+        write { tx in
+            (DependenciesBridge.shared.registrationStateChangeManager as! RegistrationStateChangeManagerImpl)
+                .registerForTests(localIdentifiers: .forUnitTests, tx: tx)
+        }
+    }
 
     func test_performance_sendPersistence_inLongConversation() throws {
         try ConversationPerformanceTestConfig.skipUnlessEnabled()
