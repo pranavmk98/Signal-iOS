@@ -4,6 +4,7 @@
 //
 
 import XCTest
+import UIKit
 
 @testable import Signal
 @testable import SignalServiceKit
@@ -1073,4 +1074,181 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
             }
         }
     }
+}
+
+final class ConversationUILayoutPerformanceTest: SignalBaseTest {
+    @MainActor
+    func test_performance_scrollLayoutThroughUnreadWindow_withoutUnreadMarker() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        measureScrollLayout(includeUnreadMarker: false, removeUnreadMarkerBeforeScroll: false)
+    }
+
+    @MainActor
+    func test_performance_scrollLayoutThroughUnreadWindow_withUnreadMarker() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        measureScrollLayout(includeUnreadMarker: true, removeUnreadMarkerBeforeScroll: false)
+    }
+
+    @MainActor
+    func test_performance_scrollLayoutAfterUnreadMarkerRemoved() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        measureScrollLayout(includeUnreadMarker: true, removeUnreadMarkerBeforeScroll: true)
+    }
+
+    @MainActor
+    private func measureScrollLayout(includeUnreadMarker: Bool, removeUnreadMarkerBeforeScroll: Bool) {
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let pageLimit = ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_SCROLL_PAGES", default: 8)
+        let scrollStepCount = max(40, pageLimit * 10)
+        let loadedItemCount = min(500, max(100, unreadCount + pageLimit * 50))
+        let viewSize = CGSize(width: 390, height: 844)
+
+        let thread = ContactThreadFactory().create()
+        let conversationStyle = ConversationStyle(
+            type: .`default`,
+            thread: thread,
+            viewWidth: viewSize.width,
+            hasWallpaper: false,
+            shouldDimWallpaperInDarkMode: false,
+            chatColor: ChatColorSettingStore.Constants.defaultColor.colorSetting,
+        )
+        let layout = ConversationViewLayout(conversationStyle: conversationStyle)
+        let layoutDelegate = ConversationPerfLayoutDelegate(
+            layoutItems: buildLayoutItems(
+                messageItemCount: loadedItemCount,
+                unreadCount: unreadCount,
+                viewWidth: viewSize.width,
+                includeUnreadMarker: includeUnreadMarker,
+            ),
+        )
+        layout.delegate = layoutDelegate
+
+        let collectionView = UICollectionView(
+            frame: CGRect(origin: .zero, size: viewSize),
+            collectionViewLayout: layout,
+        )
+        collectionView.backgroundColor = Theme.backgroundColor
+
+        if removeUnreadMarkerBeforeScroll {
+            layoutDelegate.layoutItems = buildLayoutItems(
+                messageItemCount: loadedItemCount,
+                unreadCount: unreadCount,
+                viewWidth: viewSize.width,
+                includeUnreadMarker: false,
+            )
+            layoutDelegate.renderStateId += 1
+            layout.invalidateLayout()
+        }
+
+        measure(
+            metrics: [XCTClockMetric()],
+            options: ConversationPerformanceTestConfig.measureOptions(defaultIterationCount: 3),
+        ) {
+            let contentHeight = layout.collectionViewContentSize.height
+            let maxOffsetY = max(0, contentHeight - viewSize.height)
+
+            for step in 0..<scrollStepCount {
+                let progress = CGFloat(step) / CGFloat(max(1, scrollStepCount - 1))
+                collectionView.contentOffset = CGPoint(x: 0, y: maxOffsetY * progress)
+                let visibleRect = CGRect(origin: collectionView.contentOffset, size: viewSize)
+                let visibleAttributes = layout.layoutAttributesForElements(in: visibleRect) ?? []
+                XCTAssertFalse(visibleAttributes.isEmpty)
+            }
+        }
+    }
+
+    private func buildLayoutItems(
+        messageItemCount: Int,
+        unreadCount: Int,
+        viewWidth: CGFloat,
+        includeUnreadMarker: Bool,
+    ) -> [ConversationPerfLayoutItem] {
+        var layoutItems = [ConversationPerfLayoutItem]()
+        let unreadMarkerIndex = max(1, messageItemCount - unreadCount)
+
+        for itemIndex in 0..<messageItemCount {
+            if itemIndex.isMultiple(of: 32) {
+                layoutItems.append(.dateHeader(index: itemIndex, viewWidth: viewWidth))
+            }
+            if includeUnreadMarker, itemIndex == unreadMarkerIndex {
+                layoutItems.append(.unreadMarker(index: itemIndex, viewWidth: viewWidth))
+            }
+            layoutItems.append(.message(index: itemIndex, viewWidth: viewWidth))
+        }
+        return layoutItems
+    }
+}
+
+private final class ConversationPerfLayoutDelegate: NSObject, ConversationViewLayoutDelegate {
+    var layoutItems: [ConversationViewLayoutItem]
+    var renderStateId: UInt = 1
+    let layoutHeaderHeight: CGFloat = 0
+    let layoutFooterHeight: CGFloat = 0
+    var conversationViewController: ConversationViewController? { nil }
+
+    init(layoutItems: [ConversationViewLayoutItem]) {
+        self.layoutItems = layoutItems
+    }
+}
+
+private struct ConversationPerfLayoutItem: ConversationViewLayoutItem {
+    enum ItemKind {
+        case dateHeader
+        case unreadMarker
+        case message
+    }
+
+    let interactionUniqueId: String
+    let kind: ItemKind
+    let cellSize: CGSize
+
+    static func dateHeader(index: Int, viewWidth: CGFloat) -> Self {
+        Self(
+            interactionUniqueId: "date-\(index)",
+            kind: .dateHeader,
+            cellSize: CGSize(width: viewWidth, height: 28),
+        )
+    }
+
+    static func unreadMarker(index: Int, viewWidth: CGFloat) -> Self {
+        Self(
+            interactionUniqueId: "unread-\(index)",
+            kind: .unreadMarker,
+            cellSize: CGSize(width: viewWidth, height: 34),
+        )
+    }
+
+    static func message(index: Int, viewWidth: CGFloat) -> Self {
+        let messageHeights: [CGFloat] = [44, 56, 72, 96, 128, 64]
+        return Self(
+            interactionUniqueId: "message-\(index)",
+            kind: .message,
+            cellSize: CGSize(width: viewWidth, height: messageHeights[index % messageHeights.count]),
+        )
+    }
+
+    func vSpacing(previousLayoutItem: ConversationViewLayoutItem) -> CGFloat {
+        guard let previousLayoutItem = previousLayoutItem as? ConversationPerfLayoutItem else {
+            return ConversationStyle.defaultMessageSpacing
+        }
+        switch (previousLayoutItem.kind, kind) {
+        case (.message, .message):
+            return ConversationStyle.compactMessageSpacing
+        case (_, .dateHeader), (.dateHeader, _), (_, .unreadMarker), (.unreadMarker, _):
+            return ConversationStyle.defaultMessageSpacing
+        }
+    }
+
+    var canBeUsedForContinuity: Bool { kind == .message }
+    var isDateHeader: Bool { kind == .dateHeader }
 }

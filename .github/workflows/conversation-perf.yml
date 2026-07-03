@@ -125,6 +125,9 @@ jobs:
             -resultBundlePath "$RESULT_BUNDLE" \
             -only-testing:SignalTests/MessageLoaderTest/test_performance_scrollThroughUnreadWindow_withUnreadMarker \
             -only-testing:SignalTests/MessageLoaderTest/test_performance_scrollThroughUnreadWindow_withoutUnreadMarker \
+            -only-testing:SignalTests/ConversationUILayoutPerformanceTest/test_performance_scrollLayoutThroughUnreadWindow_withUnreadMarker \
+            -only-testing:SignalTests/ConversationUILayoutPerformanceTest/test_performance_scrollLayoutThroughUnreadWindow_withoutUnreadMarker \
+            -only-testing:SignalTests/ConversationUILayoutPerformanceTest/test_performance_scrollLayoutAfterUnreadMarkerRemoved \
             -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_sendPersistence_inLongConversation \
             -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markManyUnreadsRead_inLargeConversation \
             build test \
