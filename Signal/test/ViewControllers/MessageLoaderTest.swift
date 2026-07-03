@@ -5,6 +5,8 @@
 
 import XCTest
 import UIKit
+import GRDB
+import QuartzCore
 
 @testable import Signal
 @testable import SignalServiceKit
@@ -1024,6 +1026,120 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
         }
     }
 
+    func test_performance_markReadBreakdown_inLargeConversation() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let fixture = seedThread(messageCount: messageCount, unreadTailCount: unreadCount)
+        let writeCounter = ConversationPerfDatabaseWriteCounter()
+        SSKEnvironment.shared.databaseStorageRef.databaseChangeObserver.appendDatabaseWriteDelegate(writeCounter)
+
+        resetUnreadMessages(fixture.unreadInteractionIds)
+        writeCounter.reset()
+        let cursorOnlyElapsed = elapsedSeconds {
+            let fetchedCount = write { tx -> Int in
+                let finder = InteractionFinder(threadUniqueId: fixture.thread.uniqueId)
+                var cursor = finder.fetchAllUnreadMessages(transaction: tx)
+                var count = 0
+                do {
+                    while let _ = try cursor.next() {
+                        count += 1
+                    }
+                } catch {
+                    XCTFail("Failed to fetch unread messages: \(error)")
+                }
+                return count
+            }
+            XCTAssertEqual(fetchedCount, unreadCount)
+        }
+        print("PERF_DETAIL mark_read_breakdown phase=cursor_only elapsed=\(cursorOnlyElapsed)")
+
+        resetUnreadMessages(fixture.unreadInteractionIds)
+        writeCounter.reset()
+        let directUpdateElapsed = elapsedSeconds {
+            write { tx in
+                let interactions = InteractionFinder.interactions(
+                    withInteractionIds: Set(fixture.unreadInteractionIds),
+                    transaction: tx,
+                )
+                for interaction in interactions {
+                    guard let incomingMessage = interaction as? TSIncomingMessage else {
+                        XCTFail("Expected unread fixture to contain only incoming messages.")
+                        continue
+                    }
+                    incomingMessage.anyUpdateIncomingMessage(transaction: tx) { message in
+                        message.wasRead = true
+                    }
+                }
+            }
+        }
+        print("PERF_DETAIL mark_read_breakdown phase=direct_update elapsed=\(directUpdateElapsed) interaction_commits=\(writeCounter.interactionChangesByCommit)")
+
+        resetUnreadMessages(fixture.unreadInteractionIds)
+        writeCounter.reset()
+        let fullMarkAsReadElapsed = elapsedSeconds {
+            markUnreadMessagesAsReadInSingleTransaction(fixture)
+        }
+        print("PERF_DETAIL mark_read_breakdown phase=mark_as_read elapsed=\(fullMarkAsReadElapsed) interaction_commits=\(writeCounter.interactionChangesByCommit) pending_receipt_commits=\(writeCounter.pendingReceiptChangesByCommit)")
+    }
+
+    func test_performance_markReadLocallyDefaultBatching_inLargeConversation() async throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let fixture = seedThread(messageCount: messageCount, unreadTailCount: unreadCount)
+        let writeCounter = ConversationPerfDatabaseWriteCounter()
+        SSKEnvironment.shared.databaseStorageRef.databaseChangeObserver.appendDatabaseWriteDelegate(writeCounter)
+
+        resetUnreadMessages(fixture.unreadInteractionIds)
+        writeCounter.reset()
+        let elapsed = await elapsedSecondsAsync {
+            await SSKEnvironment.shared.receiptManagerRef.markAsReadLocally(
+                beforeSortId: UInt64.max,
+                thread: fixture.thread,
+                hasPendingMessageRequest: true,
+            )
+        }
+        print("PERF_DETAIL mark_read_locally_default elapsed=\(elapsed) interaction_commits=\(writeCounter.interactionChangesByCommit) pending_receipt_commits=\(writeCounter.pendingReceiptChangesByCommit)")
+    }
+
+    func test_performance_markReadFixedSizeBatches_inLargeConversation() throws {
+        try ConversationPerformanceTestConfig.skipUnlessEnabled()
+
+        let messageCount = ConversationPerformanceTestConfig.intValue(
+            "SIGNAL_PERF_UNREAD_THREAD_MESSAGES",
+            default: 10_000,
+        )
+        let unreadCount = min(
+            ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
+            messageCount,
+        )
+        let fixture = seedThread(messageCount: messageCount, unreadTailCount: unreadCount)
+        let writeCounter = ConversationPerfDatabaseWriteCounter()
+        SSKEnvironment.shared.databaseStorageRef.databaseChangeObserver.appendDatabaseWriteDelegate(writeCounter)
+
+        resetUnreadMessages(fixture.unreadInteractionIds)
+        writeCounter.reset()
+        let elapsed = elapsedSeconds {
+            markUnreadMessagesAsReadInFixedSizeBatches(fixture, batchSize: 150)
+        }
+        print("PERF_DETAIL mark_read_fixed_batches elapsed=\(elapsed) interaction_commits=\(writeCounter.interactionChangesByCommit) pending_receipt_commits=\(writeCounter.pendingReceiptChangesByCommit)")
+    }
+
     private func seedThread(messageCount: Int, unreadTailCount: Int) -> SeededThread {
         let unreadStartIndex = max(0, messageCount - unreadTailCount)
         return write { tx in
@@ -1073,6 +1189,104 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
                 }
             }
         }
+    }
+
+    private func markUnreadMessagesAsReadInSingleTransaction(_ fixture: SeededThread) {
+        write { tx in
+            let finder = InteractionFinder(threadUniqueId: fixture.thread.uniqueId)
+            var cursor = finder.fetchAllUnreadMessages(transaction: tx)
+            do {
+                while let message = try cursor.next() {
+                    message.markAsRead(
+                        atTimestamp: Date.ows_millisecondTimestamp(),
+                        thread: fixture.thread,
+                        circumstance: .onThisDeviceWhilePendingMessageRequest,
+                        shouldClearNotifications: false,
+                        transaction: tx,
+                    )
+                }
+            } catch {
+                XCTFail("Failed to fetch unread messages: \(error)")
+            }
+        }
+    }
+
+    private func markUnreadMessagesAsReadInFixedSizeBatches(_ fixture: SeededThread, batchSize: Int) {
+        for interactionIdBatch in fixture.unreadInteractionIds.chunked(by: batchSize) {
+            write { tx in
+                let interactions = InteractionFinder.interactions(
+                    withInteractionIds: Set(interactionIdBatch),
+                    transaction: tx,
+                )
+                for interaction in interactions {
+                    guard let message = interaction as? OWSReadTracking else {
+                        XCTFail("Expected unread fixture to contain only read-tracking interactions.")
+                        continue
+                    }
+                    message.markAsRead(
+                        atTimestamp: Date.ows_millisecondTimestamp(),
+                        thread: fixture.thread,
+                        circumstance: .onThisDeviceWhilePendingMessageRequest,
+                        shouldClearNotifications: false,
+                        transaction: tx,
+                    )
+                }
+            }
+        }
+    }
+
+    private func elapsedSeconds(_ block: () -> Void) -> TimeInterval {
+        let startTime = CACurrentMediaTime()
+        block()
+        return CACurrentMediaTime() - startTime
+    }
+
+    private func elapsedSecondsAsync(_ block: () async -> Void) async -> TimeInterval {
+        let startTime = CACurrentMediaTime()
+        await block()
+        return CACurrentMediaTime() - startTime
+    }
+}
+
+private final class ConversationPerfDatabaseWriteCounter: DatabaseWriteDelegate {
+    private var currentInteractionChanges = 0
+    private var currentPendingReceiptChanges = 0
+
+    private(set) var interactionChangesByCommit = [Int]()
+    private(set) var pendingReceiptChangesByCommit = [Int]()
+
+    func reset() {
+        currentInteractionChanges = 0
+        currentPendingReceiptChanges = 0
+        interactionChangesByCommit.removeAll()
+        pendingReceiptChangesByCommit.removeAll()
+    }
+
+    func databaseDidChange(with event: DatabaseEvent) {
+        switch event.tableName {
+        case InteractionRecord.databaseTableName:
+            currentInteractionChanges += 1
+        case PendingReadReceiptRecord.databaseTableName:
+            currentPendingReceiptChanges += 1
+        default:
+            break
+        }
+    }
+
+    func databaseDidCommit(db: Database) {
+        if currentInteractionChanges > 0 {
+            interactionChangesByCommit.append(currentInteractionChanges)
+        }
+        if currentPendingReceiptChanges > 0 {
+            pendingReceiptChangesByCommit.append(currentPendingReceiptChanges)
+        }
+        currentInteractionChanges = 0
+        currentPendingReceiptChanges = 0
+    }
+
+    func databaseDidRollback(db: Database) {
+        currentInteractionChanges = 0
+        currentPendingReceiptChanges = 0
     }
 }
 

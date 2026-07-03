@@ -129,6 +129,9 @@ jobs:
             -only-testing:SignalTests/ConversationUILayoutPerformanceTest/test_performance_scrollLayoutThroughUnreadWindow_withoutUnreadMarker \
             -only-testing:SignalTests/ConversationUILayoutPerformanceTest/test_performance_scrollLayoutAfterUnreadMarkerRemoved \
             -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markManyUnreadsRead_inLargeConversation \
+            -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markReadBreakdown_inLargeConversation \
+            -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markReadLocallyDefaultBatching_inLargeConversation \
+            -only-testing:SignalTests/ConversationDatabasePerformanceTest/test_performance_markReadFixedSizeBatches_inLargeConversation \
             build test \
             2>&1 | tee "$LOG_DIR/ConversationPerf.log"
 
