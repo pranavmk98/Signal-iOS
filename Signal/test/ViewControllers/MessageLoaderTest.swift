@@ -947,6 +947,7 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
     private struct SeededThread {
         let thread: TSContactThread
         let unreadInteractionIds: [String]
+        let lastUnreadSortId: UInt64
     }
 
     private lazy var incomingMessageBody = String(repeating: "incoming perf message ", count: 3)
@@ -1109,7 +1110,7 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
         writeCounter.reset()
         let elapsed = await elapsedSecondsAsync {
             await SSKEnvironment.shared.receiptManagerRef.markAsReadLocally(
-                beforeSortId: UInt64.max,
+                beforeSortId: fixture.lastUnreadSortId,
                 thread: fixture.thread,
                 hasPendingMessageRequest: true,
             )
@@ -1143,67 +1144,55 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
     private func seedThread(messageCount: Int, unreadTailCount: Int) -> SeededThread {
         let unreadStartIndex = max(0, messageCount - unreadTailCount)
         return write { tx in
-            let thread = ContactThreadFactory().create(transaction: tx)
-            let incomingFactory = IncomingMessageFactory()
-            incomingFactory.threadCreator = { _ in thread }
-            incomingFactory.messageBodyBuilder = { self.incomingMessageBody }
-
-            let outgoingFactory = OutgoingMessageFactory()
-            outgoingFactory.threadCreator = { _ in thread }
-            outgoingFactory.messageBodyBuilder = { self.outgoingMessageBody }
-
-            var unreadInteractionIds = [String]()
-            for messageIndex in 0..<messageCount {
-                autoreleasepool {
-                    if messageIndex >= unreadStartIndex {
-                        let message = incomingFactory.create(transaction: tx)
-                        unreadInteractionIds.append(message.uniqueId)
-                    } else if messageIndex.isMultiple(of: 2) {
-                        let message = incomingFactory.create(transaction: tx)
-                        message.anyUpdateIncomingMessage(transaction: tx) { message in
-                            message.wasRead = true
-                        }
-                    } else {
-                        _ = outgoingFactory.create(transaction: tx)
-                    }
-                }
-            }
-
-            return SeededThread(thread: thread, unreadInteractionIds: unreadInteractionIds)
+            seedThread(messageCount: messageCount, unreadStartIndex: unreadStartIndex, tx: tx)
         }
     }
 
     private func seedThreadAsync(messageCount: Int, unreadTailCount: Int) async -> SeededThread {
         let unreadStartIndex = max(0, messageCount - unreadTailCount)
         return await DependenciesBridge.shared.db.awaitableWrite { tx in
-            let thread = ContactThreadFactory().create(transaction: tx)
-            let incomingFactory = IncomingMessageFactory()
-            incomingFactory.threadCreator = { _ in thread }
-            incomingFactory.messageBodyBuilder = { self.incomingMessageBody }
+            self.seedThread(messageCount: messageCount, unreadStartIndex: unreadStartIndex, tx: tx)
+        }
+    }
 
-            let outgoingFactory = OutgoingMessageFactory()
-            outgoingFactory.threadCreator = { _ in thread }
-            outgoingFactory.messageBodyBuilder = { self.outgoingMessageBody }
+    private func seedThread(
+        messageCount: Int,
+        unreadStartIndex: Int,
+        tx: DBWriteTransaction,
+    ) -> SeededThread {
+        let thread = ContactThreadFactory().create(transaction: tx)
+        let incomingFactory = IncomingMessageFactory()
+        incomingFactory.threadCreator = { _ in thread }
+        incomingFactory.messageBodyBuilder = { self.incomingMessageBody }
 
-            var unreadInteractionIds = [String]()
-            for messageIndex in 0..<messageCount {
-                autoreleasepool {
-                    if messageIndex >= unreadStartIndex {
-                        let message = incomingFactory.create(transaction: tx)
-                        unreadInteractionIds.append(message.uniqueId)
-                    } else if messageIndex.isMultiple(of: 2) {
-                        let message = incomingFactory.create(transaction: tx)
-                        message.anyUpdateIncomingMessage(transaction: tx) { message in
-                            message.wasRead = true
-                        }
-                    } else {
-                        _ = outgoingFactory.create(transaction: tx)
+        let outgoingFactory = OutgoingMessageFactory()
+        outgoingFactory.threadCreator = { _ in thread }
+        outgoingFactory.messageBodyBuilder = { self.outgoingMessageBody }
+
+        var unreadInteractionIds = [String]()
+        var lastUnreadSortId: UInt64 = 0
+        for messageIndex in 0..<messageCount {
+            autoreleasepool {
+                if messageIndex >= unreadStartIndex {
+                    let message = incomingFactory.create(transaction: tx)
+                    unreadInteractionIds.append(message.uniqueId)
+                    lastUnreadSortId = message.sortId
+                } else if messageIndex.isMultiple(of: 2) {
+                    let message = incomingFactory.create(transaction: tx)
+                    message.anyUpdateIncomingMessage(transaction: tx) { message in
+                        message.wasRead = true
                     }
+                } else {
+                    _ = outgoingFactory.create(transaction: tx)
                 }
             }
-
-            return SeededThread(thread: thread, unreadInteractionIds: unreadInteractionIds)
         }
+
+        return SeededThread(
+            thread: thread,
+            unreadInteractionIds: unreadInteractionIds,
+            lastUnreadSortId: lastUnreadSortId,
+        )
     }
 
     private func resetUnreadMessages(_ interactionIds: [String]) {
