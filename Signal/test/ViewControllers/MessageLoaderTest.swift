@@ -1101,11 +1101,11 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
             ConversationPerformanceTestConfig.intValue("SIGNAL_PERF_UNREAD_MESSAGES", default: 250),
             messageCount,
         )
-        let fixture = seedThread(messageCount: messageCount, unreadTailCount: unreadCount)
+        let fixture = await seedThreadAsync(messageCount: messageCount, unreadTailCount: unreadCount)
         let writeCounter = ConversationPerfDatabaseWriteCounter()
         SSKEnvironment.shared.databaseStorageRef.databaseChangeObserver.appendDatabaseWriteDelegate(writeCounter)
 
-        resetUnreadMessages(fixture.unreadInteractionIds)
+        await resetUnreadMessagesAsync(fixture.unreadInteractionIds)
         writeCounter.reset()
         let elapsed = await elapsedSecondsAsync {
             await SSKEnvironment.shared.receiptManagerRef.markAsReadLocally(
@@ -1173,8 +1173,59 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
         }
     }
 
+    private func seedThreadAsync(messageCount: Int, unreadTailCount: Int) async -> SeededThread {
+        let unreadStartIndex = max(0, messageCount - unreadTailCount)
+        return await DependenciesBridge.shared.db.awaitableWrite { tx in
+            let thread = ContactThreadFactory().create(transaction: tx)
+            let incomingFactory = IncomingMessageFactory()
+            incomingFactory.threadCreator = { _ in thread }
+            incomingFactory.messageBodyBuilder = { self.incomingMessageBody }
+
+            let outgoingFactory = OutgoingMessageFactory()
+            outgoingFactory.threadCreator = { _ in thread }
+            outgoingFactory.messageBodyBuilder = { self.outgoingMessageBody }
+
+            var unreadInteractionIds = [String]()
+            for messageIndex in 0..<messageCount {
+                autoreleasepool {
+                    if messageIndex >= unreadStartIndex {
+                        let message = incomingFactory.create(transaction: tx)
+                        unreadInteractionIds.append(message.uniqueId)
+                    } else if messageIndex.isMultiple(of: 2) {
+                        let message = incomingFactory.create(transaction: tx)
+                        message.anyUpdateIncomingMessage(transaction: tx) { message in
+                            message.wasRead = true
+                        }
+                    } else {
+                        _ = outgoingFactory.create(transaction: tx)
+                    }
+                }
+            }
+
+            return SeededThread(thread: thread, unreadInteractionIds: unreadInteractionIds)
+        }
+    }
+
     private func resetUnreadMessages(_ interactionIds: [String]) {
         write { tx in
+            let interactions = InteractionFinder.interactions(
+                withInteractionIds: Set(interactionIds),
+                transaction: tx,
+            )
+            for interaction in interactions {
+                guard let incomingMessage = interaction as? TSIncomingMessage else {
+                    XCTFail("Expected unread fixture to contain only incoming messages.")
+                    continue
+                }
+                incomingMessage.anyUpdateIncomingMessage(transaction: tx) { message in
+                    message.wasRead = false
+                }
+            }
+        }
+    }
+
+    private func resetUnreadMessagesAsync(_ interactionIds: [String]) async {
+        await DependenciesBridge.shared.db.awaitableWrite { tx in
             let interactions = InteractionFinder.interactions(
                 withInteractionIds: Set(interactionIds),
                 transaction: tx,
