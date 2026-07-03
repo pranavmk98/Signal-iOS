@@ -1176,7 +1176,7 @@ final class ConversationDatabasePerformanceTest: SignalBaseTest {
                 if messageIndex >= unreadStartIndex {
                     let message = incomingFactory.create(transaction: tx)
                     unreadInteractionIds.append(message.uniqueId)
-                    lastUnreadSortId = message.sortId
+                    lastUnreadSortId = UInt64(message.sqliteRowId!)
                 } else if messageIndex.isMultiple(of: 2) {
                     let message = incomingFactory.create(transaction: tx)
                     message.anyUpdateIncomingMessage(transaction: tx) { message in
